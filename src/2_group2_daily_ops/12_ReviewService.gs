@@ -1,0 +1,1374 @@
+/**
+ * VERSION: 5.5.014
+ * FILE: 12_ReviewService.gs
+ * LMDS V5.5 — Review Queue Service
+ * [FIX BUG-B2] v5.4.003: updateReviewRowStatus_() helper — 1 setValues แทน 5× setValue
+ * [FIX BUG-B2] v5.4.003: applyAllPendingDecisions — Time Guard + Batch Status
+ * [FIX BUG-A2] v5.4.003: applyAllPendingDecisions — เพิ่ม try-catch outer
+ * [FIX v5.5.005] แก้ Syntax Error บรรทัด 259 (try block ไม่มี catch/finally)
+ * [FIX v5.5.005] เพิ่ม return statement ใน applyReviewDecision() — ทำให้ Review เขียน FACT_DELIVERY ได้
+ * [FIX v5.5.005] ลบ dead code resolveGeoAndDest_() — ละเมิดกฎ Architecture
+ * ===================================================
+ * PURPOSE:
+ * จัดการคิวรีวิว Q_REVIEW — พักข้อมูลที่ต้องให้คนตัดสินใจ
+ * ===================================================
+ *   v5.5.014 (2026-06-19) — DRIVER VERIFIED COLUMNS + ALIAS ENRICHMENT:
+ *     - [ADD] เพิ่ม 2 คอลัมน์ "ชื่อลูกค้าปลายทางจริง" + "ชื่อสถานที่อยู่ลูกค้าปลายทางจริง"
+ *       ใน Source sheet (col 38-39), DAILY_JOB (col 29-30), FACT_DELIVERY (col 32-33)
+ *     - [ADD] SRC_IDX.DRIVER_VERIFIED_NAME/ADDR, DATA_IDX.DRIVER_VERIFIED_NAME/ADDR, FACT_IDX.DRIVER_VERIFIED_NAME/ADDR
+ *     - [ADD] 04_SourceRepository buildSourceObj_ อ่าน col 38-39 → srcObj.driverVerifiedName/Addr
+ *     - [ADD] 11_TransactionService upsertFactDelivery เก็บ col 32-33 ใน FACT_DELIVERY
+ *     - [ADD] 10_MatchEngine autoEnrichAliases สร้าง alias จาก "ชื่อจริง" → master_uuid (confidence=100, source=DRIVER_VERIFIED)
+ *     - [ADD] 18_ServiceSCG copyDriverVerifiedToDailyJob_ คัดลอกจาก Source → DAILY_JOB
+ *     - กฎ: ชื่อดิบ match ตามปกติ 100% + ถ้าชื่อจริงมี → สร้าง alias เพิ่ม
+ *   v5.5.013 (2026-06-19) — GOOGLE MAPS REFACTOR:
+ *     - [REWRITE] 15_GoogleMapsAPI.gs เขียนใหม่ทั้งไฟล์ — ลบระบบ 3-layer cache + MAPS_CACHE sheet
+ *       เพิ่มสูตร Amit Agarwal 7 ตัว เป็น @customFunction (พิมพ์ใน Sheet ได้):
+ *       GOOGLEMAPS_DISTANCE, GOOGLEMAPS_DURATION, GOOGLEMAPS_LATLONG,
+ *       GOOGLEMAPS_ADDRESS, GOOGLEMAPS_REVERSEGEOCODE, GOOGLEMAPS_COUNTRY, GOOGLEMAPS_DIRECTIONS
+ *     - [REMOVE] ลบ MAPS_CACHE sheet จาก SCHEMA, SHEET, MAPS_CACHE_IDX, setupAllSheets
+ *     - [REMOVE] ลบฟังก์ชันเก่าที่ไม่มี caller: geocodeAddress, reverseGeocode,
+ *       getRouteDistanceKm, cachedGeoLookup_, _loadSheetCache_, _flushHitCounts_,
+ *       getFromSheetCache_, saveToSheetCache_, clearMapsCache
+ *     - เหตุผล: ระบบ LMDS ไม่ได้เรียก Google Maps API ผ่าน code แล้ว
+ *       DIST_FROM_WH และ RESOLVED_ADDR มาจาก AppSheet ที่ผู้ใช้ทำไว้แล้ว
+ *   v5.5.012 (2026-06-19) — ANTIPATTERN FIX + DOC SYNC:
+ *     - [FIX #1] showVersionInfo() แก้จาก v5.5.010 → v5.5.012 + Audit Cycles 5 → 9
+ *     - [FIX #3] resolvePerson เพิ่ม optional preNormResult เพื่อหลีกเลี่ยง double normalization
+ *       17_SearchService ส่ง normResult เข้า resolvePerson แทน cleanName (ลด normalize ซ้อน)
+ *     - [FIX #4] reprocessReviewQueue ใช้ REVIEW_IDX/FACT_IDX constants แทน headers.indexOf()
+ *       ปฏิบัติตาม Single Source of Truth rule
+ *     - [FIX #5] validateConfig เรียก validateSchemaConsistency เพิ่ม — onOpen จับ SCHEMA drift ได้
+ *     - [FIX #2] CHANGELOG sync — เพิ่ม v5.5.011 entry ในไฟล์ที่ยังไม่มี (20 ไฟล์)
+ *     - [DOC] แก้ broken cross-references ใน README (ลบ reports/* และ LMDS_V5.5_COMPLETE_Audit_Report.md)
+ *     - [DOC] Standardize function count = 313 ในเอกสาร .md
+ *     - [DOC] อัปเดต DEPENDENCIES/ARCHITECTURE section ในไฟล์ที่แก้ (00, 01, 06, 12, 17)
+ *   v5.5.011 (2026-06-19) — DATA CONSISTENCY + SHIPTONAME CLEAN + Q_REVIEW NAV FIX:
+ *     - [FIX] 02_Schema.gs เพิ่ม SCHEMA['SCGนครหลวงJWDภูมิภาค'] (37 cols) ที่ขาดหายไป
+ *     - [FIX] 17_SearchService findBestGeoByPersonPlace ผ่าน normalizePersonNameFull ก่อนค้นหา
+ *     - [ADD] 12_ReviewService buildRecommendedAction_ สร้าง ID สำหรับ Smart Navigation
+ *     - [ADD] 00_App handleRecommendClick_ + navigateFromRecommend_ สำหรับ Q_REVIEW Nav
+ *   v5.5.010 (2026-06-18) — CACHE HOTFIX + Q_REVIEW Post-Processor:
+ *     - [FIX HOTFIX #1] saveChunkedCache_ แบ่ง putAll เป็น batch 5 chunks + ลด chunk size 90KB→80KB
+ *       Root cause: GAS putAll limit total payload ~1MB → 48 chunks × 90KB = 4.3MB → "อาร์กิวเมนต์มากเกินไป"
+ *     - [FIX HOTFIX #2] loadAllPlaces_ ลบ fallback path ที่ใช้ cache.put ตรง — บังคับใช้ saveChunkedCache_
+ *       Root cause: เมื่อ saveChunkedCache_ ไม่พร้อม → fallback → 825KB > 100KB → "M_PLACE Cache เต็ม"
+ *     - [FIX HOTFIX #3] loadAllPlaceAliases_ ลบ fallback path เดียวกัน — บังคับใช้ saveChunkedCache_
+ *       Root cause: 312KB > 100KB → "M_PLACE_ALIAS Cache write error: อาร์กิวเมนต์มากเกินไป"
+ *     - [ADD] รวม reprocessReviewQueue + analyzeReviewPatterns จาก 22_AccuracyPatch.gs เข้า 12_ReviewService.gs
+ *       Auto-resolve Q_REVIEW 3 กลุ่ม: GEO_NEARBY_YELLOW+name, NEW_RECORD+Geo, FUZZY_MATCH 85+
+ *   v5.5.009 (2026-06-18) — DOC SYNC:
+ *     - [DOC] อัปเดต DEPENDENCIES section ใน 12 ไฟล์ให้สะท้อน V5.5.007/V5.5.008 cache changes
+ *     - [DOC] อัปเดต ARCHITECTURE section ใน 12 ไฟล์ให้สะท้อน cache architecture ใหม่
+ *     - [DOC] อัปเดตเอกสาร .md ทั้ง 23 ไฟล์ให้เป็น V5.5.008 (post-CACHE-CLEANUP)
+ *     - [DOC] เพิ่ม audit cycle 6-8 ใน README/BLUEPRINT history tables
+ *     - [DOC] เพิ่ม section "V5.5.007 + V5.5.008 — CACHE FIX & CLEANUP (15 issues)" ใน README
+ *     - [SYNC] Canonical values: 8 audit cycles, 68 issues fixed, 196 helper functions
+ *   v5.5.008 (2026-06-18) — CACHE CLEANUP (P2):
+ *     - [FIX P2 #10] clearMapsCache flush _MAPS_SHEET_HIT_DIRTY ก่อนล้าง (รักษา analytics)
+ *     - [FIX P2 #11] เพิ่ม flushLogBuffer_() ใน finally ของ 5 entry points
+ *       (runLoadSource, buildGeoDictionary, MIGRATION_HybridAliasSystem, populateGeoMetadata, runPreflightAudit)
+ *     - [FIX P2 #12] ลบ redundant manual cache nulling ใน populateGeoMetadata ใช้ invalidate*Cache_* แทน
+ *     - [FIX P2 #13] saveChunkedCache_ ล้าง orphaned chunks เมื่อขนาดข้อมูลลดลง (large→small)
+ *     - [FIX P2 #14] getCachedDistricts_ write-back to cache on miss (consistent with getCachedProvinces_)
+ *     - [CONFIRM P2 #15] TH_GEO_POSTCODE chunk size byte-based ใน primary path (V5.5.007 แก้แล้ว)
+ *   v5.5.007 (2026-06-18) — CACHE FIX (P0 + P1):
+ *     - [FIX P0 #1] invalidateAllGlobalCaches() ล้าง RAM cache ครบ 11 ตัว (เดิม 6/11)
+ *     - [FIX P0 #2] invalidateGeoDictCache() ล้าง _GLOBAL_GEO_DICT_SEARCH_KEY_INDEX
+ *     - [FIX P0 #3] applyAllPendingDecisions เพิ่ม invalidateSameDayDestCache_ + autoEnrichAliases
+ *     - [FIX P0 #4] migrateStep1_AssignUuid_ ใช้ invalidateChunkedCache_ แทน raw removeAll
+ *     - [ADD P1 #5] invalidateGeoLatLngCache_ ใน TransactionService + เรียกจาก GeoService
+ *     - [FIX P1 #6] M_PLACE_ALL/M_PLACE_ALIAS_ALL แปลงเป็น chunked cache (saveChunkedCache_)
+ *     - [FIX P1 #7] 4 chunked writers ใช้ centralized saveChunkedCache_ (putAll 5-10× เร็วขึ้น)
+ *     - [ADD P1 #8] CACHE_KEY ขยายจาก 2 → 13 keys (Single Source of Truth)
+ *     - [ADD P1 #9] safeCacheGet_/safeCachePut_/safeCacheRemoveAll_ helpers ใน 14_Utils
+ *   v5.5.006 (2026-06-18) — Consistency Sync:
+ *     - [SYNC] All 22 files version bump 5.5.004 → 5.5.006 (12_ReviewService from 5.5.005)
+ *     - [SYNC] Documentation consistency: line count 13,831, function count 310
+ *     - [SYNC] Standardized all metadata claims across .gs and .md files (53 issues fixed)
+ * v5.5.005 (2026-06-16) — CRITICAL Fix:
+ * - [FIX] Syntax Error: Missing catch/finally after try (line 259)
+ * - [FIX] applyReviewDecision() ไม่มี return statement → Review ไม่เขียน FACT_DELIVERY
+ * - [FIX] ลบ dead code resolveGeoAndDest_()
+ * v5.5.004 (2026-06-15) — full sync cycle:
+ * - [SYNC] All 22 files version bump 5.5.003 → 5.5.004
+ * - [SYNC] Documentation audit: 28 inconsistencies fixed
+ * v5.5.003 (2026-06-12) — post-REFACTOR sync:
+ * - [SYNC] Version header V5.4 → V5.5, VERSION → 5.5.003
+ * - [SYNC] CHANGELOG entries added for 5 Audit Cycles
+ * v5.5.002 (2026-06-11) — CRITICAL Fix Cycle (8 issues):
+ * - [FIX] CRIT-001 through CRIT-008 — see CRITICAL audit report
+ * - [FIX] RAM Cache, Safe Batching, Checkpoint+Resume enhancements
+ * v5.5.001 (2026-06-04) — 22-file bug fix + RAM Cache:
+ * - [FIX] 22 files updated — bug fixes per CRITICAL/PERFORMANCE audits
+ * - [ADD] RAM Cache layer (_SOURCE_ROWS_RAM_CACHE, _MAPS_SHEET_CACHE)
+ * - [ADD] SearchKey, safeUiAlert_, JSON.parse guard
+ * v5.4.001 (2026-05-24) — Single Writer Pattern:
+ * - [ADD] Comprehensive header documentation
+ * v5.4.000 (2026-05-24):
+ * - [UPGRADE] Version bump to 5.4.000
+ * - [ADD] Comprehensive header documentation
+ * - [ADD] DEPENDENCIES section with module relationships
+ * - [ENHANCE] Detailed module interconnection mapping
+ * v5.2.010 (PH2 Hardening):
+ * - [UPGRADE] อัปเกรดระบบเป็น 5.2.010
+ * ===================================================
+ * DEPENDENCIES:
+ * REQUIRES (Load Order):
+ * - 01_Config (SHEET.Q_REVIEW, SHEET.SOURCE, REVIEW_IDX.*, SRC_IDX.*, APP_CONST.*)
+ * - 02_Schema (SCHEMA)
+ * - 10_MatchEngine (resolveAndPersist_ gateway)
+ * - 07_PlaceService (getEnrichedGeoData)
+ * - 11_TransactionService (upsertFactDelivery)
+ * - 14_Utils (generateShortId, normalizeInvoiceNo)
+ * - 03_SetupSheets (logError, logInfo, logWarn, logDebug, safeUiAlert_)
+ * - 10_MatchEngine (invalidateSameDayDestCache_, autoEnrichAliasesFromFactBatch_)
+ *   [V5.5.007 P0 #3]
+ * CALLS (Invokes):
+ * - resolveAndPersist_() → 10_MatchEngine (Gateway for Group 1 CRUD)
+ * - getEnrichedGeoData() → 07_PlaceService (Optional enrichment)
+ * - invalidateSameDayDestCache_() → 10_MatchEngine (called from
+ *   applyAllPendingDecisions to mirror persistResult_ cache invalidation) [V5.5.007 P0 #3]
+ * - autoEnrichAliasesFromFactBatch_() → 10_MatchEngine (called from
+ *   applyAllPendingDecisions to enrich M_ALIAS from newly-approved FACTs) [V5.5.007 P0 #3]
+ * - maskReviewerEmail_() → Local security helper
+ * - logError/logInfo/logWarn/logDebug() → 03_SetupSheets
+ * 
+ * NOTE: ไม่เรียก Group 1 CRUD functions โดยตรงอีกต่อไป
+ * ใช้ resolveAndPersist_() gateway แทน (REF-001)
+ * EXPORTS TO:
+ * - 00_App (openReviewQueue, applyAllPendingDecisions, applyReviewDecision, highlightHighPriorityReviews)
+ * - 10_MatchEngine (enqueueReview)
+ * SHEETS ACCESSED:
+ * - SHEET.Q_REVIEW (Read+Write: review queue entries)
+ * - SHEET.SOURCE (Read: restore delivery date/time)
+ * ===================================================
+ * ARCHITECTURE:
+ * Review Queue Manager
+ * ┌──────────────────────────────────────────────┐
+ * │ enqueueReview                                │
+ * │ └─ add pending review to Q_REVIEW            │
+ * │ applyAllPendingDecisions                     │
+ * │ └─ batch process all pending decisions       │
+ * │    [V5.5.007 P0 #3] now mirrors persistResult_│
+ * │    cache invalidation: calls invalidateSameDay│
+ * │    DestCache_ + autoEnrichAliasesFromFactBatch│
+ * │    _() (was missing → stale same-day dest +  │
+ * │    M_ALIAS never enriched from review path)  │
+ * │ applyReviewDecision                          │
+ * │ ├─ CREATE_NEW → resolve + create masters     │
+ * │ ├─ MERGE_TO_CANDIDATE → merge person recs    │
+ * │ ├─ ESCALATE → mark as Escalated              │
+ * │ └─ IGNORE → mark as Done                     │
+ * │ getReviewStats                               │
+ * │ └─ queue statistics (pending/done/escalated) │
+ * │ highlightHighPriorityReviews                 │
+ * │ └─ visual priority marking (batch colors)    │
+ * └──────────────────────────────────────────────┘
+ * ===================================================
+ */
+
+// ============================================================
+// SECTION 1: enqueueReview
+// ============================================================
+
+function enqueueReview(srcObj, decision, personResult, placeResult, geoResult) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(SHEET.Q_REVIEW);
+    if (!sheet) {
+      logError('ReviewService', 'ไม่พบชีต ' + SHEET.Q_REVIEW);
+      return null;
+    }
+
+    const now = new Date();
+    const newId = generateShortId('R');
+    const candPersonIds = personResult && personResult.personId
+      ? JSON.stringify([personResult.personId]) : JSON.stringify([]);
+    const candPlaceIds = placeResult && placeResult.placeId
+      ? JSON.stringify([placeResult.placeId]) : JSON.stringify([]);
+
+    let candGeoIds = JSON.stringify([]);
+    if (geoResult) {
+      if (geoResult.candidateGeoIds && geoResult.candidateGeoIds.length > 0) {
+        candGeoIds = JSON.stringify(geoResult.candidateGeoIds);
+      } else if (geoResult.geoId) {
+        candGeoIds = JSON.stringify([geoResult.geoId]);
+      }
+    }
+
+    const newRow = new Array(SCHEMA[SHEET.Q_REVIEW].length).fill('');
+    newRow[REVIEW_IDX.REVIEW_ID] = newId;
+    newRow[REVIEW_IDX.ISSUE_TYPE] = decision ? decision.reason : 'UNKNOWN';
+    newRow[REVIEW_IDX.PRIORITY] = decision ? (decision.priority || 2) : 2;
+    newRow[REVIEW_IDX.SOURCE_REC_ID] = srcObj.sourceId || '';
+    newRow[REVIEW_IDX.SOURCE_ROW] = srcObj.sourceRow || 0;
+    newRow[REVIEW_IDX.INVOICE_NO] = srcObj.invoiceNo || '';
+    newRow[REVIEW_IDX.RAW_PERSON] = srcObj.rawPersonName || '';
+
+    let rawPlace = srcObj.rawPlaceName || '';
+    const rawAddr = srcObj.rawAddress || '';
+
+    // [FIX v5.5.001] ทำให้ getEnrichedGeoData() เป็น optional
+    // ถ้าเรียกไม่ได้ (เช่น Maps API error) ก็ข้ามไป ไม่ใช่ข้อมูลจำเป็นสำหรับ review row
+    try {
+      const enrich = getEnrichedGeoData(rawAddr, rawPlace);
+      if (enrich && enrich.fullAddress) {
+        const hasGeoInfo = /จังหวัด|อำเภอ|เขต|ตำบล|แขวง/.test(rawPlace);
+        if (rawPlace.length < 10 || !hasGeoInfo) {
+          rawPlace = rawPlace ? rawPlace + ' (' + enrich.fullAddress + ')' : enrich.fullAddress;
+        }
+      }
+    } catch (enrichErr) {
+      logDebug('ReviewService', 'enqueueReview: getEnrichedGeoData ข้าม — ' + enrichErr.message);
+    }
+
+    newRow[REVIEW_IDX.RAW_PLACE] = rawPlace || rawAddr;
+    newRow[REVIEW_IDX.RAW_SYS_ADDR] = rawAddr;
+    newRow[REVIEW_IDX.RAW_LAT] = srcObj.rawLat || 0;
+    newRow[REVIEW_IDX.RAW_LNG] = srcObj.rawLng || 0;
+    newRow[REVIEW_IDX.CAND_PERSONS] = candPersonIds;
+    newRow[REVIEW_IDX.CAND_PLACES] = candPlaceIds;
+    newRow[REVIEW_IDX.CAND_GEOS] = candGeoIds;
+    newRow[REVIEW_IDX.CAND_DESTS] = JSON.stringify([]);
+    newRow[REVIEW_IDX.MATCH_SCORE] = decision ? (decision.confidence || 0) : 0;
+    // [V5.5.011] สร้าง recommended_action ที่มี ID จริง เพื่อให้ผู้ review คลิกแล้วนำทางได้
+    //   ก่อนหน้านี้ใส่ค่าคงที่ 'MANUAL_REVIEW' ทำให้ Smart Navigation ไม่สามารถ parse ID และนำทางได้
+    //   ตอนนี้ระบบจะแนะนำ action ที่เหมาะสมตามข้อมูลที่มี:
+    //     - มี candidate Person → "MERGE_TO_CANDIDATE:PS-XXXX" (เร็วสุด คลิกได้เลย)
+    //     - มี candidate Place  → "MERGE_TO_CANDIDATE:PL-XXXX"
+    //     - ไม่มี candidate     → "CREATE_NEW" (ให้ reviewer ตัดสินใจ)
+    newRow[REVIEW_IDX.RECOMMEND] = buildRecommendedAction_(personResult, placeResult, geoResult, decision);
+    newRow[REVIEW_IDX.STATUS] = 'Pending';
+    newRow[REVIEW_IDX.REVIEWER] = '';
+    newRow[REVIEW_IDX.REVIEWED_AT] = '';
+    newRow[REVIEW_IDX.DECISION] = '';
+    newRow[REVIEW_IDX.NOTE] = decision ? (decision.reason || '') : '';
+
+    return { reviewId: newId, rowData: newRow };
+
+  } catch (e) {
+    logError('ReviewService', 'enqueueReview ล้มเหลว: ' + e.message);
+    return null;
+  }
+}
+
+// ============================================================
+// SECTION 1.5: buildRecommendedAction_ [V5.5.011]
+// สร้างค่า recommended_action ที่มี ID จริง เพื่อให้ Smart Navigation
+// สามารถ parse ID และนำทางไปยัง Master/FACT sheet ได้เมื่อผู้ review คลิก
+// ============================================================
+
+/**
+ * buildRecommendedAction_ — สร้างคำแนะนำ action พร้อม ID สำหรับคอลัมน์ recommended_action
+ *
+ * รูปแบบผลลัพธ์ที่เป็นไปได้:
+ *   - "MERGE_TO_CANDIDATE:PS-XXXX"     มี candidate Person → แนะนำ merge
+ *   - "MERGE_TO_CANDIDATE:PL-XXXX"     มี candidate Place (ไม่มี Person) → แนะนำ merge
+ *   - "CREATE_NEW"                     ไม่มี candidate → แนะนำสร้างใหม่
+ *   - "MANUAL_REVIEW"                  กรณีพิเศษที่ไม่สามารถตัดสินใจอัตโนมัติได้
+ *
+ * Smart Navigation ใน 00_App.gs จะ parse ID (PS-XXXX หรือ PL-XXXX)
+ * และนำทางไปยัง M_PERSON/M_PLACE + FACT_DELIVERY เพื่อให้ reviewer ยืนยัน
+ *
+ * @param {Object|null} personResult - { personId, status, confidence } จาก resolvePerson
+ * @param {Object|null} placeResult  - { placeId, status, confidence } จาก resolvePlace
+ * @param {Object|null} geoResult    - { geoId, candidateGeoIds } จาก GeoService
+ * @param {Object|null} decision     - { reason, priority, confidence } จาก MatchEngine
+ * @return {string} recommended action string พร้อม ID สำหรับ navigation
+ */
+function buildRecommendedAction_(personResult, placeResult, geoResult, decision) {
+  try {
+    // ดึง ID จาก candidate results
+    var personId = personResult && personResult.personId
+      ? String(personResult.personId).trim() : '';
+    var placeId = placeResult && placeResult.placeId
+      ? String(placeResult.placeId).trim() : '';
+
+    // กรณี 1: มี candidate Person → แนะนำ MERGE_TO_CANDIDATE พร้อม Person ID
+    if (personId) {
+      return 'MERGE_TO_CANDIDATE:' + personId;
+    }
+
+    // กรณี 2: มี candidate Place (แต่ไม่มี Person) → แนะนำ MERGE ด้วย Place ID
+    if (placeId) {
+      return 'MERGE_TO_CANDIDATE:' + placeId;
+    }
+
+    // กรณี 3: มี Geo candidate แต่ไม่มี Person/Place → CREATE_NEW
+    // (มีพิกัด GPS ใกล้เคียง แต่เป็นร้านใหม่)
+    if (geoResult && geoResult.geoId) {
+      return 'CREATE_NEW:GP-' + String(geoResult.geoId).trim();
+    }
+
+    // กรณี 4: ไม่มี candidate ใดเลย → CREATE_NEW ล้วน
+    return 'CREATE_NEW';
+  } catch (e) {
+    // Fallback: ใช้ค่าเดิมเพื่อไม่ให้ break review queue
+    logDebug('ReviewService', 'buildRecommendedAction_ fallback: ' + e.message);
+    return 'MANUAL_REVIEW';
+  }
+}
+
+// ============================================================
+// SECTION 2: applyAllPendingDecisions
+// [FIX BUG-B2] Time Guard (ป้องกัน Timeout กับ Queue ใหญ่)
+// [FIX BUG-A2] try-catch outer
+// [FIX v5.5.005] แก้ Syntax Error — ลบ try block ที่ไม่มี catch/finally
+// ============================================================
+
+function applyAllPendingDecisions() {
+  // [FIX CRIT-006] เพิ่ม LockService — ป้องกัน Race Condition เมื่อ 2 ผู้ใช้รันพร้อมกัน
+  const lock = LockService.getScriptLock();
+  try {
+    lock.tryLock(APP_CONST.LOCK_TIMEOUT_MS);
+  } catch (e) {
+    safeUiAlert_('⚠️ ไม่สามารถประมวลผล Review ได้ — มีการรันซ้อนอยู่');
+    return;
+  }
+  
+  if (!lock.hasLock()) {
+    safeUiAlert_('⚠️ ระบบกำลังประมวลผล Review อยู่ กรุณารอสักครู่');
+    return;
+  }
+
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(SHEET.Q_REVIEW);
+    if (!sheet || sheet.getLastRow() < 2) return;
+
+    // [FIX BUG-B2] Time Guard
+    const startTime = new Date();
+    const timeLimit = AI_CONFIG.TIME_LIMIT_MS || (5 * 60 * 1000);
+
+    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1,
+      SCHEMA[SHEET.Q_REVIEW].length).getValues();
+
+    let processed = 0;
+    let timedOut = false;
+
+    // [PERF-006] Batch status updates for IGNORE/ESCALATE (no side effects)
+    const pendingStatusUpdates = [];
+    const pendingFactRows = []; // [PERF-002] สะสม FACT_DELIVERY rows
+    const batchNow = new Date();
+    let reviewer = 'System';
+
+    try {
+      // [SEC-007] Mask reviewer email สำหรับ Audit Trail
+      const rawEmail = Session.getActiveUser().getEmail() || Session.getEffectiveUser().getEmail() || 'Admin';
+      reviewer = maskReviewerEmail_(rawEmail);
+    } catch (e) {
+      reviewer = 'Admin (Auto)';
+    }
+
+    for (let i = 0; i < data.length; i++) {
+      // [FIX BUG-B2] Time Guard ทุก 20 แถว
+      if (i % 20 === 0 && i > 0 && (new Date() - startTime) > timeLimit) {
+        logWarn('ReviewService', 'applyAllPendingDecisions: Time Guard หยุดที่แถว ' + i + '/' + data.length);
+        timedOut = true;
+        break;
+      }
+
+      const rowResult = reviewProcessOneRow_(data[i], i + 2, reviewer, batchNow);
+      if (rowResult.statusUpdate) pendingStatusUpdates.push(rowResult.statusUpdate);
+      if (rowResult.factRow) pendingFactRows.push(rowResult.factRow);
+      processed += rowResult.processed;
+    }
+
+    // [PERF-006] Flush batch status updates
+    if (pendingStatusUpdates.length > 0) {
+      batchUpdateReviewStatus_(sheet, pendingStatusUpdates);
+    }
+
+    // [PERF-002] Flush batch FACT_DELIVERY writes — เขียนทั้งหมดครั้งเดียวหลังลูป
+    if (pendingFactRows.length > 0) {
+      var factSheet = ss.getSheetByName(SHEET.FACT_DELIVERY);
+      if (factSheet) {
+        factSheet.getRange(factSheet.getLastRow() + 1, 1, pendingFactRows.length, pendingFactRows[0].length)
+          .setValues(pendingFactRows);
+        if (typeof invalidateFactInvoiceCache_ === 'function') invalidateFactInvoiceCache_();
+        // [FIX v5.5.007 P0 #3] เพิ่ม invalidations ที่ขาดหายไป ให้ตรงกับ persistResult_ ของ MatchEngine
+        // เดิมลืม invalidate same-day dest cache และ alias enrichment สำหรับ Review-approved FACT rows
+        // ทำให้ cache เก่าและ M_ALIAS ไม่ถูก enrich หลัง Review
+        if (typeof invalidateSameDayDestCache_ === 'function') invalidateSameDayDestCache_();
+        try {
+          if (typeof autoEnrichAliasesFromFactBatch_ === 'function') {
+            autoEnrichAliasesFromFactBatch_(pendingFactRows);
+          }
+        } catch (enrichErr) {
+          logError('ReviewService', 'autoEnrichAliasesFromFactBatch_ ล้มเหลว (ไม่บล็อกการทำงานหลัก): ' + enrichErr.message, enrichErr);
+        }
+      }
+    }
+
+    logInfo('ReviewService',
+      'applyAllPendingDecisions: ประมวลผล ' + processed + ' รายการ' +
+      ' (batch status: ' + pendingStatusUpdates.length + ')' +
+      (timedOut ? ' (หยุดก่อนครบ — Time Guard)' : '')
+    );
+
+    if (timedOut) {
+      safeUiAlert_('⚠️ ประมวลผลไป ' + processed + ' รายการ แต่หยุดกลางคันเพราะใกล้ Timeout\nกรุณารันอีกครั้ง');
+    }
+
+    return processed;
+
+  } catch (err) {
+    logError('ReviewService', 'applyAllPendingDecisions: ' + err.message, err);
+    safeUiAlert_('❌ เกิดข้อผิดพลาด: ' + err.message);
+  } finally {
+    // [FIX CRIT-006] ปล่อย Lock เสมอ แม้เกิด error
+    lock.releaseLock();
+    // [PERF-012] Flush log buffer ก่อน execution จบ — ป้องกัน log entries สูญหาย
+    if (typeof flushLogBuffer_ === 'function') flushLogBuffer_();
+  }
+}
+
+/**
+ * reviewProcessOneRow_ — processes 1 review row for applyAllPendingDecisions
+ * Checks status/decision, handles IGNORE/ESCALATE batch paths and CREATE_NEW/MERGE side effects
+ * @param {Array} rowData - single row from Q_REVIEW data
+ * @param {number} rowIndex - 1-based row number in sheet (i + 2)
+ * @param {string} reviewer - masked reviewer email
+ * @param {Date} batchNow - timestamp for batch operations
+ * @return {{ statusUpdate: Object|null, factRow: Array|null, processed: number, error: Error|null }}
+ */
+function reviewProcessOneRow_(rowData, rowIndex, reviewer, batchNow) {
+  const status = String(rowData[REVIEW_IDX.STATUS] || '').trim();
+  const decision = String(rowData[REVIEW_IDX.DECISION] || '').trim();
+  const reviewId = String(rowData[REVIEW_IDX.REVIEW_ID] || '').trim();
+
+  if (status === 'Done' || !decision) {
+    return { statusUpdate: null, factRow: null, processed: 0, error: null };
+  }
+
+  try {
+    // [PERF-006] IGNORE/ESCALATE don't have side effects → batch update
+    if (decision === 'IGNORE') {
+      return {
+        statusUpdate: {
+          targetRow: rowIndex, status: 'Done', reviewer: reviewer, now: batchNow,
+          decisionVal: decision, note: ''
+        },
+        factRow: null,
+        processed: 1,
+        error: null
+      };
+    } else if (decision === 'ESCALATE') {
+      return {
+        statusUpdate: {
+          targetRow: rowIndex, status: 'Escalated', reviewer: reviewer, now: batchNow,
+          decisionVal: decision, note: ''
+        },
+        factRow: null,
+        processed: 1,
+        error: null
+      };
+    } else {
+      // CREATE_NEW / MERGE_TO_CANDIDATE — have side effects, call normally
+      // [PERF-002] เก็บ factData ที่ส่งคืนมาเพื่อเขียน batch ทีเดียวหลังลูป
+      var reviewResult = applyReviewDecision(reviewId, decision, rowData, rowIndex);
+      var factRow = (reviewResult && reviewResult.factRowData) ? reviewResult.factRowData : null;
+      return {
+        statusUpdate: null,
+        factRow: factRow,
+        processed: 1,
+        error: null
+      };
+    }
+  } catch (err) {
+    logError('ReviewService', 'applyAllPendingDecisions row ' + reviewId + ': ' + err.message, err);
+    return { statusUpdate: null, factRow: null, processed: 0, error: err };
+  }
+}
+
+/**
+ * batchUpdateReviewStatus_ — [PERF-006] Batch update status columns for multiple rows
+ * Instead of updateReviewRowStatus_ per row (2N API calls),
+ * read range once → modify in RAM → write once (2 API calls total)
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet
+ * @param {Array} updates - [{ targetRow, status, reviewer, now, decisionVal, note }]
+ */
+function batchUpdateReviewStatus_(sheet, updates) {
+  if (!updates || updates.length === 0) return;
+
+  const minCol = Math.min(
+    REVIEW_IDX.STATUS, REVIEW_IDX.REVIEWER, REVIEW_IDX.REVIEWED_AT,
+    REVIEW_IDX.DECISION, REVIEW_IDX.NOTE
+  ) + 1;
+
+  const maxCol = Math.max(
+    REVIEW_IDX.STATUS, REVIEW_IDX.REVIEWER, REVIEW_IDX.REVIEWED_AT,
+    REVIEW_IDX.DECISION, REVIEW_IDX.NOTE
+  ) + 1;
+
+  const numCols = maxCol - minCol + 1;
+  const minRow = Math.min(...updates.map(u => u.targetRow));
+  const maxRow = Math.max(...updates.map(u => u.targetRow));
+  const rowCount = maxRow - minRow + 1;
+
+  const range = sheet.getRange(minRow, minCol, rowCount, numCols);
+  const allVals = range.getValues();
+
+  updates.forEach(function(u) {
+    const rowIdx = u.targetRow - minRow;
+    if (rowIdx < 0 || rowIdx >= rowCount) return;
+    allVals[rowIdx][REVIEW_IDX.STATUS - (minCol - 1)] = u.status;
+    allVals[rowIdx][REVIEW_IDX.REVIEWER - (minCol - 1)] = u.reviewer;
+    allVals[rowIdx][REVIEW_IDX.REVIEWED_AT - (minCol - 1)] = u.now;
+    allVals[rowIdx][REVIEW_IDX.DECISION - (minCol - 1)] = u.decisionVal;
+    allVals[rowIdx][REVIEW_IDX.NOTE - (minCol - 1)] = u.note || '';
+  });
+
+  range.setValues(allVals);
+}
+
+// ============================================================
+// SECTION 3: applyReviewDecision
+// [FIX BUG-B2] ใช้ updateReviewRowStatus_() แทน 5× setValue
+// [REF-004] Refactored to Decision Router (~30 lines) + helper functions
+// [REF-013] buildSrcObjFromReview_ extracted for srcObj construction
+// [FIX v5.5.005] เพิ่ม return statement — ทำให้ Review เขียน FACT_DELIVERY ได้
+// ============================================================
+
+/**
+ * applyReviewDecision — [REF-004] Decision Router
+ * Delegates to step-specific helpers for each decision type.
+ * Preserves all existing behavior.
+ * [FIX v5.5.005] เพิ่ม return statement เพื่อส่ง factRowData กลับไป caller
+ */
+function applyReviewDecision(reviewId, decisionVal, rowData, optTargetRow) {
+  // [FIX B1 v5.5.002] เพิ่ม try-catch outer — menu entry point ต้องมี error handling
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(SHEET.Q_REVIEW);
+    if (!sheet) return null;
+
+    const now = new Date();
+    let reviewer = 'System';
+
+    try {
+      const rawEmail = Session.getActiveUser().getEmail() || Session.getEffectiveUser().getEmail() || 'Admin';
+      reviewer = maskReviewerEmail_(rawEmail);
+    } catch (e) {
+      reviewer = 'Admin (Auto)';
+    }
+
+    // [FIX B2] ใช้ optTargetRow จาก caller ถ้ามี → ไม่ต้องอ่าน sheet ซ้ำ
+    let targetRow = optTargetRow || -1;
+    let rowArr = rowData;
+
+    if (targetRow === -1 || !rowArr) {
+      const data = sheet.getRange(2, 1, sheet.getLastRow() - 1,
+        SCHEMA[SHEET.Q_REVIEW].length).getValues();
+      for (let i = 0; i < data.length; i++) {
+        if (String(data[i][REVIEW_IDX.REVIEW_ID]).trim() === reviewId) {
+          targetRow = i + 2;
+          if (!rowArr) rowArr = data[i];
+          break;
+        }
+      }
+    }
+
+    if (targetRow === -1 || !rowArr) {
+      logWarn('ReviewService', 'applyReviewDecision: ไม่พบ reviewId ' + reviewId);
+      return null;
+    }
+
+    // [REF-004] Decision Router — delegates to helpers
+    // [FIX v5.5.005] เก็บ result จาก helper เพื่อ return กลับไป caller
+    let result = null;
+
+    switch (decisionVal) {
+      case 'CREATE_NEW':
+        result = executeReviewCreateNew_(ss, sheet, targetRow, rowArr, reviewer, now, decisionVal);
+        break;
+      case 'MERGE_TO_CANDIDATE':
+        result = executeMergeDecision_(ss, sheet, targetRow, rowArr, reviewer, now, decisionVal);
+        break;
+      case 'ESCALATE':
+        updateReviewRowStatus_(sheet, targetRow, 'Escalated', reviewer, now, decisionVal, '');
+        break;
+      case 'IGNORE':
+        updateReviewRowStatus_(sheet, targetRow, 'Done', reviewer, now, decisionVal, '');
+        break;
+      default:
+        logWarn('ReviewService', 'applyReviewDecision: Unknown decision ' + decisionVal);
+        break;
+    }
+
+    logInfo('ReviewService', 'applyReviewDecision: ' + reviewId + ' → ' + decisionVal + ' โดย ' + reviewer);
+
+    // [FIX v5.5.005] return result เพื่อให้ caller ได้ factRowData
+    return result;
+
+  } catch (e) {
+    logError('ReviewService', 'applyReviewDecision ล้มเหลว: ' + e.message, e);
+    safeUiAlert_('เกิดข้อผิดพลาดในการประมวลผล Review: ' + e.message);
+    return null;
+  }
+}
+
+// ============================================================
+// SECTION 3a: Review Helper Functions [REF-004 + REF-013]
+// ============================================================
+
+/**
+ * parseCandidatesFromReview_ — [REF-004] Parse candidate JSON from review row
+ * Safely parses CAND_PERSONS and CAND_PLACES JSON strings
+ * @param {Array} rowData - Review row data array
+ * @return {{ candPersonIds: Array, candPlaceIds: Array }}
+ */
+function parseCandidatesFromReview_(rowData) {
+  const candPersonStr = String(rowData[REVIEW_IDX.CAND_PERSONS] || '[]').trim();
+  const candPlaceStr = String(rowData[REVIEW_IDX.CAND_PLACES] || '[]').trim();
+
+  let candPersonIds = [];
+  let candPlaceIds = [];
+
+  try { candPersonIds = JSON.parse(candPersonStr); } catch (e) {}
+  try { candPlaceIds = JSON.parse(candPlaceStr); } catch (e) {}
+
+  return { candPersonIds: candPersonIds, candPlaceIds: candPlaceIds };
+}
+
+/**
+ * buildSrcObjFromReview_ — [REF-004 + REF-013] Construct srcObj from review row data
+ * Reads delivery date/time from SOURCE sheet if available.
+ * @param {Spreadsheet} ss - Active spreadsheet
+ * @param {Array} rowData - Review row data array
+ * @return {Object} srcObj literal for upsertFactDelivery
+ */
+function buildSrcObjFromReview_(ss, rowData) {
+  const rawPerson = String(rowData[REVIEW_IDX.RAW_PERSON] || '').trim();
+  const rawPlace = String(rowData[REVIEW_IDX.RAW_PLACE] || '').trim();
+  const rawAddr = String(rowData[REVIEW_IDX.RAW_SYS_ADDR] || '').trim();
+  const rawLat = Number(rowData[REVIEW_IDX.RAW_LAT] || 0);
+  const rawLng = Number(rowData[REVIEW_IDX.RAW_LNG] || 0);
+  const sourceRowIdx = Number(rowData[REVIEW_IDX.SOURCE_ROW] || 0);
+
+  let deliveryDate = '', deliveryTime = '';
+
+  if (sourceRowIdx > 1) {
+    const srcSheet = ss.getSheetByName(SHEET.SOURCE);
+    if (srcSheet) {
+      const srcData = srcSheet.getRange(sourceRowIdx, 1, 1, srcSheet.getLastColumn()).getValues()[0];
+      if (srcData[SRC_IDX.DELIVERY_DATE]) {
+        try { deliveryDate = new Date(srcData[SRC_IDX.DELIVERY_DATE]).toISOString(); }
+        catch (e) { deliveryDate = String(srcData[SRC_IDX.DELIVERY_DATE]); }
+      }
+      deliveryTime = srcData[SRC_IDX.DELIVERY_TIME];
+    }
+  }
+
+  return {
+    invoiceNo: normalizeInvoiceNo(rowData[REVIEW_IDX.INVOICE_NO]),
+    sourceRow: sourceRowIdx,
+    sourceId: String(rowData[REVIEW_IDX.SOURCE_REC_ID] || '').trim(),
+    rawPersonName: rawPerson, rawPlaceName: rawPlace,
+    rawAddress: rawAddr, rawLat: rawLat, rawLng: rawLng,
+    hasGeo: !isNaN(rawLat) && !isNaN(rawLng) && rawLat !== 0 && rawLng !== 0,
+    province: '', warehouse: '', driverName: '', truckLicense: '',
+    soldToCode: '', soldToName: '', carrierCode: '', carrierName: '',
+    shipmentNo: '', deliveryDate: deliveryDate, deliveryTime: deliveryTime,
+    sourceSheet: SHEET.Q_REVIEW,
+  };
+}
+
+/**
+ * executeMergeDecision_ — [REF-004] Handle MERGE_TO_CANDIDATE decision
+ * [REF-001] Now delegates to resolveAndPersist_() instead of calling Group 1 CRUD directly
+ * Extracted from applyReviewDecision MERGE_TO_CANDIDATE case.
+ * @param {Spreadsheet} ss
+ * @param {Sheet} sheet - Q_REVIEW sheet
+ * @param {number} targetRow - 1-based row number
+ * @param {Array} rowArr - row data array
+ * @param {string} reviewer
+ * @param {Date} now
+ * @param {string} decisionVal
+ */
+function executeMergeDecision_(ss, sheet, targetRow, rowArr, reviewer, now, decisionVal) {
+  // [REF-004] Parse candidates via helper
+  const candidates = parseCandidatesFromReview_(rowArr);
+
+  // [REF-004 + REF-013] Build srcObj via helper
+  const srcObj = buildSrcObjFromReview_(ss, rowArr);
+
+  // [REF-001] Delegate to resolveAndPersist_ gateway — no direct Group 1 CRUD calls
+  const result = resolveAndPersist_(srcObj, 'MERGE_TO_CANDIDATE', candidates);
+
+  // [PERF-002] สะสม factData ส่งคืนแทนการเขียนทันที — ลดจาก N API calls เหลือ 1 batch write
+  if (result && result.factRowData) {
+    return { factRowData: result.factRowData };
+  }
+
+  // [FIX BUG-B2] 1 setValues
+  updateReviewRowStatus_(sheet, targetRow, 'Done', reviewer, now, decisionVal, '');
+  return null;
+}
+
+// ============================================================
+// SECTION 3.5: updateReviewRowStatus_ [NEW BUG-B2 Helper]
+// รวม 5× getRange().setValue() → 1× getRange().setValues()
+// ลด 5 API calls → 1 API call ต่อ decision
+// ============================================================
+
+/**
+ * updateReviewRowStatus_ — Batch update status columns ใน Q_REVIEW
+ * [NEW v5.4.003] แทนที่ 5× setValue ที่กระจายใน applyReviewDecision()
+ */
+function updateReviewRowStatus_(sheet, targetRow, status, reviewer, now, decisionVal, note) {
+  // อ่าน block คอลัมน์ที่ต้องอัปเดต (STATUS ถึง NOTE เป็น consecutive range)
+  const minCol = Math.min(
+    REVIEW_IDX.STATUS, REVIEW_IDX.REVIEWER, REVIEW_IDX.REVIEWED_AT,
+    REVIEW_IDX.DECISION, REVIEW_IDX.NOTE
+  ) + 1; // 1-based
+
+  const maxCol = Math.max(
+    REVIEW_IDX.STATUS, REVIEW_IDX.REVIEWER, REVIEW_IDX.REVIEWED_AT,
+    REVIEW_IDX.DECISION, REVIEW_IDX.NOTE
+  ) + 1; // 1-based
+
+  const numCols = maxCol - minCol + 1;
+  const range = sheet.getRange(targetRow, minCol, 1, numCols);
+  const vals = range.getValues()[0]; // อ่าน 1 ครั้ง
+
+  // แก้ค่าใน RAM (0-based relative offset)
+  vals[REVIEW_IDX.STATUS - (minCol - 1)] = status;
+  vals[REVIEW_IDX.REVIEWER - (minCol - 1)] = reviewer;
+  vals[REVIEW_IDX.REVIEWED_AT - (minCol - 1)] = now;
+  vals[REVIEW_IDX.DECISION - (minCol - 1)] = decisionVal;
+  vals[REVIEW_IDX.NOTE - (minCol - 1)] = note || '';
+
+  range.setValues([vals]); // ✅ 1 write API call
+}
+
+// ============================================================
+// SECTION 3.6: executeReviewCreateNew_ [RF-02 Extracted from applyReviewDecision]
+// แยก CREATE_NEW case ออกจาก applyReviewDecision เพื่อลด cognitive load
+// [REF-004 + REF-013] Uses buildSrcObjFromReview_ for srcObj construction
+// Logic เดิมทั้งหมด ไม่เปลี่ยน behavior
+// ============================================================
+
+/**
+ * executeReviewCreateNew_ — ดำเนินการ CREATE_NEW decision
+ * [RF-02] แยกจาก applyReviewDecision CREATE_NEW case (~80 บรรทัด)
+ * [REF-013] Uses buildSrcObjFromReview_ for srcObj construction
+ * [REF-001] Now delegates to resolveAndPersist_() instead of calling Group 1 CRUD directly
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet - Q_REVIEW sheet
+ * @param {number} targetRow - 1-based row number
+ * @param {Array} rowArr - row data array
+ * @param {string} reviewer - reviewer name
+ * @param {Date} now - current timestamp
+ * @param {string} decisionVal - decision value ('CREATE_NEW')
+ */
+function executeReviewCreateNew_(ss, sheet, targetRow, rowArr, reviewer, now, decisionVal) {
+  // [REF-013] Build srcObj via shared helper instead of inline construction
+  const srcObj = buildSrcObjFromReview_(ss, rowArr);
+
+  // [REF-001] Delegate to resolveAndPersist_ gateway — no direct Group 1 CRUD calls
+  const result = resolveAndPersist_(srcObj, 'CREATE_NEW', null);
+
+  // [PERF-002] สะสม factData ส่งคืนแทนการเขียนทันที — ลดจาก N API calls เหลือ 1 batch write
+  // caller (applyAllPendingDecisions) จะเขียน batch หลังลูปจบ
+  if (result && result.factRowData) {
+    return { factRowData: result.factRowData };
+  }
+
+  updateReviewRowStatus_(sheet, targetRow, 'Done', reviewer, now, decisionVal, 'Resolved (Created New)');
+  return null;
+}
+
+// ============================================================
+// SECTION 4: Stats & Report (ไม่เปลี่ยน)
+// ============================================================
+
+function getReviewStats() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(SHEET.Q_REVIEW);
+  const stats = { pending: 0, done: 0, escalated: 0, total: 0 };
+
+  if (!sheet || sheet.getLastRow() < 2) return stats;
+
+  const statusCol = REVIEW_IDX.STATUS + 1;
+  const totalRows = sheet.getLastRow() - 1;
+  const statusData = sheet.getRange(2, statusCol, totalRows, 1).getValues();
+
+  statusData.forEach(r => {
+    const s = String(r[0] || '').trim();
+    stats.total++;
+    if (s === 'Done') stats.done++;
+    else if (s === 'Escalated') stats.escalated++;
+    else stats.pending++;
+  });
+
+  return stats;
+}
+
+function highlightHighPriorityReviews() {
+  // [FIX B2 v5.5.002] เพิ่ม try-catch — menu entry point ต้องมี error handling
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(SHEET.Q_REVIEW);
+    if (!sheet || sheet.getLastRow() < 2) return;
+
+    const totalRows = sheet.getLastRow() - 1;
+    const totalCols = SCHEMA[SHEET.Q_REVIEW].length;
+    const data = sheet.getRange(2, 1, totalRows, totalCols).getValues();
+
+    const bgColors = [];
+    data.forEach(row => {
+      const priority = Number(row[REVIEW_IDX.PRIORITY] || 0);
+      const status = String(row[REVIEW_IDX.STATUS] || '').trim();
+      let color = null;
+
+      if (status === 'Done') color = '#d9ead3';
+      else if (priority >= 3) color = '#f4cccc';
+      else if (priority === 2) color = '#fff2cc';
+
+      bgColors.push(Array(totalCols).fill(color));
+    });
+
+    sheet.getRange(2, 1, totalRows, totalCols).setBackgrounds(bgColors);
+    logDebug('ReviewService', 'highlightHighPriorityReviews: ' + totalRows + ' แถว');
+  } catch (e) {
+    logError('ReviewService', 'highlightHighPriorityReviews ล้มเหลว: ' + e.message, e);
+  }
+}
+
+// ============================================================
+// SECTION 5: Security Helpers (SEC-007 Fix)
+// ============================================================
+
+/**
+ * maskReviewerEmail_ — [SEC-007] ปกปิด Email ผู้ Review สำหรับ Audit Trail
+ * แสดงเฉพาะส่วนต้น + @ + domain ไม่แสดงชื่อเต็ม
+ * ตัวอย่าง: "somchai@company.com" → "s***i@company.com"
+ * @param {string} email
+ * @return {string}
+ */
+function maskReviewerEmail_(email) {
+  if (!email || email === 'Admin' || email === 'Admin (Auto)' || email === 'System') return email;
+
+  const parts = String(email).split('@');
+  if (parts.length !== 2) return email;
+
+  const local = parts[0];
+  const domain = parts[1];
+
+  if (local.length <= 2) return local[0] + '***@' + domain;
+  return local[0] + '***' + local[local.length - 1] + '@' + domain;
+}
+
+// ============================================================
+// SECTION 6: [ADD v5.5.010] Q_REVIEW Post-Processor
+// ย้ายมาจากไฟล์ 22_AccuracyPatch.gs (V5.5.005b) — รวมเข้า codebase หลัก
+// Auto-resolve รายการ Q_REVIEW ที่ปลอดภัย 3 กลุ่ม เพื่อลดงาน manual review
+// ============================================================
+
+/**
+ * extractFirstId_ — [V5.5.010] ดึง ID แรกจาก JSON array string
+ * ตัวอย่าง: '["P8EB059B4B35E","P1234567890AB"]' → 'P8EB059B4B35E'
+ * @param {string} jsonStr
+ * @return {string|null}
+ */
+function extractFirstId_(jsonStr) {
+  if (!jsonStr) return null;
+  jsonStr = String(jsonStr).trim();
+  if (jsonStr === '[]' || jsonStr === '') return null;
+  try {
+    var arr = JSON.parse(jsonStr);
+    if (arr && arr.length > 0) return String(arr[0]).replace(/"/g, '');
+  } catch (e) {
+    var m = jsonStr.match(/["']([A-Za-z0-9]+)["']/);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+/**
+ * safeExtractArr_ — [V5.5.010] ดึงค่าจาก array อย่างปลอดภัย
+ * @param {Array} arr
+ * @param {number} idx
+ * @return {*}
+ */
+function safeExtractArr_(arr, idx) {
+  if (!arr || idx < 0 || idx >= arr.length) return '';
+  return arr[idx];
+}
+
+/**
+ * reprocessReviewQueue — [V5.5.010] ลด Q_REVIEW โดย auto-resolve รายการที่ปลอดภัย
+ *
+ * รันหลัง runMatchEngine() เสร็จ จะอ่าน Q_REVIEW ที่ Pending
+ * แล้วจัดการ 3 กลุ่ม:
+ *   A. GEO_NEARBY_YELLOW + มีชื่อตรง → AUTO_MATCH (GPS ใกล้เคียง 50-200m + Person/Place ตรง)
+ *   B. NEW_RECORD_PENDING + มี Geo candidate → CREATE_NEW (GPS ตรงจุดเดิม แต่ชื่อใหม่)
+ *   C. FUZZY_MATCH score >= 85 → AUTO_MATCH (ชื่อคล้ายกันมาก 85%+)
+ *
+ * วิธีรัน: เลือกฟังก์ชันนี้ใน dropdown → กด ▶ Run
+ */
+function reprocessReviewQueue() {
+  var startTime = Date.now();
+
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var reviewSheet = ss.getSheetByName(SHEET.Q_REVIEW);
+  var factSheet = ss.getSheetByName(SHEET.FACT_DELIVERY);
+
+  if (!reviewSheet || reviewSheet.getLastRow() < 2) {
+    safeUiAlert_('Q_REVIEW ว่าง — ไม่มีข้อมูลจัดการ');
+    return;
+  }
+  if (!factSheet) {
+    safeUiAlert_('ไม่พบชีต FACT_DELIVERY');
+    return;
+  }
+
+  // ═══════════════════════════════════════
+  // PHASE 1: อ่านข้อมูลทั้งหมดเข้า Memory
+  // ═══════════════════════════════════════
+
+  var reviewLastRow = reviewSheet.getLastRow();
+  var reviewCols = reviewSheet.getLastColumn();
+  var reviewHeaders = reviewSheet.getRange(1, 1, 1, reviewCols).getValues()[0];
+  var reviewData = reviewSheet.getRange(2, 1, reviewLastRow - 1, reviewCols).getValues();
+
+  var factLastRow = factSheet.getLastRow();
+  var factCols = factSheet.getLastColumn();
+  var factHeaders = factSheet.getRange(1, 1, 1, factCols).getValues()[0];
+  var factData = factLastRow > 1
+    ? factSheet.getRange(2, 1, factLastRow - 1, factCols).getValues()
+    : [];
+
+  // ═══════════════════════════════════════
+  // PHASE 2: สร้าง Column Index Map (จาก Single Source of Truth)
+  // [FIX v5.5.012 Anti-pattern #4] เปลี่ยนจาก headers.indexOf() → REVIEW_IDX.* / FACT_IDX.*
+  //   เดิมใช้ headers.indexOf() ทำให้ละเมิด Single Source of Truth rule และเสี่ยงต่อ typo
+  //   ตอนนี้อ้างอิงจาก REVIEW_IDX (01_Config.gs) และ FACT_IDX (01_Config.gs) โดยตรง
+  //   ยังคง fallback ด้วย indexOf ในกรณี sheet header ไม่ตรง SCHEMA (defensive)
+  // ═══════════════════════════════════════
+
+  // [FIX v5.5.012] ใช้ REVIEW_IDX.* เป็น primary แล้ว fallback ด้วย indexOf
+  var RI = {
+    issueType:  REVIEW_IDX.ISSUE_TYPE,
+    srcRecId:   REVIEW_IDX.SOURCE_REC_ID,
+    invoiceNo:  REVIEW_IDX.INVOICE_NO,
+    rawPerson:  REVIEW_IDX.RAW_PERSON,
+    rawPlace:   REVIEW_IDX.RAW_PLACE,
+    rawAddr:    REVIEW_IDX.RAW_SYS_ADDR,
+    rawLat:     REVIEW_IDX.RAW_LAT,
+    rawLng:     REVIEW_IDX.RAW_LNG,
+    candPerson: REVIEW_IDX.CAND_PERSONS,
+    candPlace:  REVIEW_IDX.CAND_PLACES,
+    candGeo:    REVIEW_IDX.CAND_GEOS,
+    candDest:   REVIEW_IDX.CAND_DESTS,
+    score:      REVIEW_IDX.MATCH_SCORE,
+    status:     REVIEW_IDX.STATUS,
+    reviewer:   REVIEW_IDX.REVIEWER,
+    reviewedAt: REVIEW_IDX.REVIEWED_AT,
+    decision:   REVIEW_IDX.DECISION,
+    note:       REVIEW_IDX.NOTE
+  };
+
+  // [FIX v5.5.012] ใช้ FACT_IDX.* เป็น primary
+  var FI = {
+    srcRecId:        FACT_IDX.SOURCE_REC_ID,
+    deliveryDate:    FACT_IDX.DELIVERY_DATE,
+    personId:        FACT_IDX.PERSON_ID,
+    placeId:         FACT_IDX.PLACE_ID,
+    geoId:           FACT_IDX.GEO_ID,
+    destId:          FACT_IDX.DEST_ID,
+    matchStatus:     FACT_IDX.MATCH_STATUS,
+    matchConfidence: FACT_IDX.MATCH_CONF,
+    matchReason:     FACT_IDX.MATCH_REASON,
+    matchAction:     FACT_IDX.MATCH_ACTION,
+    matchEvidence:   FACT_IDX.EVIDENCE,
+    updatedAt:       FACT_IDX.UPDATED_AT,
+    rawLat:          FACT_IDX.RAW_LAT,
+    rawLng:          FACT_IDX.RAW_LNG
+  };
+
+  // Build FACT_DELIVERY lookup: source_record_id → ดัชนี array
+  var factLookup = {};
+  for (var fi = 0; fi < factData.length; fi++) {
+    var sid = String(safeExtractArr_(factData[fi], FI.srcRecId)).trim();
+    if (sid) factLookup[sid] = fi;
+  }
+
+  // ═══════════════════════════════════════
+  // PHASE 3: ประมวลผลทีละรายการ
+  // ═══════════════════════════════════════
+
+  var stats = {
+    groupA: 0,       // GEO_NEARBY_YELLOW + name → AUTO_MATCH
+    groupB: 0,       // NEW_RECORD_PENDING + geo → CREATE_NEW
+    groupC: 0,       // FUZZY_MATCH 85+ → AUTO_MATCH
+    destCreated: 0,  // จำนวน Destination ที่สร้าง
+    skipped: 0,
+    notFound: 0,
+    errors: 0,
+    errorList: []
+  };
+
+  var now = new Date();
+
+  for (var i = 0; i < reviewData.length; i++) {
+    var r = reviewData[i];
+
+    // Skip non-pending
+    if (String(safeExtractArr_(r, RI.status)).trim() !== 'Pending') continue;
+
+    var issueType = String(safeExtractArr_(r, RI.issueType)).trim();
+    var score = parseInt(safeExtractArr_(r, RI.score)) || 0;
+    var srcRecId = String(safeExtractArr_(r, RI.srcRecId)).trim();
+    var rawPerson = String(safeExtractArr_(r, RI.rawPerson)).trim();
+    var rawPlace  = String(safeExtractArr_(r, RI.rawPlace)).trim();
+    var rawAddr   = String(safeExtractArr_(r, RI.rawAddr)).trim();
+    var rawLat    = parseFloat(safeExtractArr_(r, RI.rawLat)) || 0;
+    var rawLng    = parseFloat(safeExtractArr_(r, RI.rawLng)) || 0;
+    var candPerson = String(safeExtractArr_(r, RI.candPerson) || '[]').trim();
+    var candPlace  = String(safeExtractArr_(r, RI.candPlace) || '[]').trim();
+    var candGeo    = String(safeExtractArr_(r, RI.candGeo) || '[]').trim();
+
+    // หา FACT_DELIVERY row
+    var factIdx = factLookup[srcRecId];
+    if (factIdx === undefined) {
+      stats.notFound++;
+      continue;
+    }
+
+    // ─────────────────────────────────────────
+    // GROUP A: GEO_NEARBY_YELLOW + ชื่อตรง → AUTO_MATCH
+    // ─────────────────────────────────────────
+    if (issueType === 'GEO_NEARBY_YELLOW' && (candPerson !== '[]' || candPlace !== '[]')) {
+      try {
+        var personId = extractFirstId_(candPerson);
+        var placeId  = extractFirstId_(candPlace);
+        var geoId    = extractFirstId_(candGeo);
+
+        if (personId && FI.personId >= 0) factData[factIdx][FI.personId] = personId;
+        if (placeId && FI.placeId >= 0)  factData[factIdx][FI.placeId] = placeId;
+        if (geoId && FI.geoId >= 0)      factData[factIdx][FI.geoId] = geoId;
+        if (FI.matchStatus >= 0)     factData[factIdx][FI.matchStatus] = 'AUTO_MATCHED';
+        if (FI.matchConfidence >= 0) factData[factIdx][FI.matchConfidence] = 82;
+        if (FI.matchReason >= 0)     factData[factIdx][FI.matchReason] = 'GEO_ANCHOR_AUTO';
+        if (FI.matchAction >= 0)     factData[factIdx][FI.matchAction] = 'AUTO_MATCH';
+        if (FI.matchEvidence >= 0) {
+          var ev = 'geo_nearby_50_200m';
+          if (personId) ev += '|person_match';
+          if (placeId) ev += '|place_match';
+          ev += '|post_process_v55';
+          factData[factIdx][FI.matchEvidence] = ev;
+        }
+        if (FI.updatedAt >= 0) factData[factIdx][FI.updatedAt] = now;
+
+        if ((personId || placeId) && geoId) {
+          try {
+            var newDestId = createDestination(personId, placeId, geoId, rawLat, rawLng, '');
+            if (newDestId) {
+              if (FI.destId >= 0) factData[factIdx][FI.destId] = newDestId;
+              stats.destCreated++;
+            }
+          } catch (e) {
+            stats.errorList.push('Dest-A: ' + srcRecId + ' - ' + e.message);
+          }
+        }
+
+        if (RI.status >= 0)     r[RI.status] = 'Auto_Resolved';
+        if (RI.reviewer >= 0)   r[RI.reviewer] = 'SYSTEM_V55';
+        if (RI.reviewedAt >= 0) r[RI.reviewedAt] = now;
+        if (RI.decision >= 0)   r[RI.decision] = 'AUTO_MATCH';
+        if (RI.note >= 0)       r[RI.note] = 'GEO_NEARBY_YELLOW + name match → auto-resolved by v5.5.010';
+
+        stats.groupA++;
+      } catch (e) {
+        stats.errors++;
+        stats.errorList.push('GroupA: ' + srcRecId + ' - ' + e.message);
+      }
+      continue;
+    }
+
+    // ─────────────────────────────────────────
+    // GROUP B: NEW_RECORD_PENDING + มี Geo → CREATE_NEW
+    // ─────────────────────────────────────────
+    if (issueType === 'NEW_RECORD_PENDING' && candGeo !== '[]') {
+      try {
+        var geoId = extractFirstId_(candGeo);
+        var personId = null;
+        var placeId = null;
+        var destId = null;
+
+        if (rawPerson) {
+          try {
+            var pRes = resolvePerson(rawPerson);
+            if (pRes && pRes.status === 'FOUND' && pRes.personId) {
+              personId = pRes.personId;
+            } else if (pRes && pRes.normResult) {
+              personId = createPerson(pRes.normResult);
+            }
+          } catch (e2) {
+            stats.errorList.push('Person-B: ' + srcRecId + ' - ' + e2.message);
+          }
+        }
+
+        var placeInput = rawPlace || rawAddr || '';
+        if (placeInput) {
+          try {
+            var plRes = resolvePlace(placeInput, '');
+            if (plRes && plRes.status === 'FOUND' && plRes.placeId) {
+              placeId = plRes.placeId;
+            } else if (plRes && plRes.normResult) {
+              placeId = createPlace(plRes.normResult, '', '', '', '');
+            }
+          } catch (e2) {
+            stats.errorList.push('Place-B: ' + srcRecId + ' - ' + e2.message);
+          }
+        }
+
+        if ((personId || placeId) && geoId) {
+          try {
+            destId = createDestination(personId, placeId, geoId, rawLat, rawLng, '');
+            stats.destCreated++;
+          } catch (e2) {
+            stats.errorList.push('Dest-B: ' + srcRecId + ' - ' + e2.message);
+          }
+        }
+
+        if (personId && FI.personId >= 0) factData[factIdx][FI.personId] = personId;
+        if (placeId && FI.placeId >= 0)  factData[factIdx][FI.placeId] = placeId;
+        if (geoId && FI.geoId >= 0)      factData[factIdx][FI.geoId] = geoId;
+        if (destId && FI.destId >= 0)    factData[factIdx][FI.destId] = destId;
+        if (FI.matchStatus >= 0)     factData[factIdx][FI.matchStatus] = 'CREATED';
+        if (FI.matchConfidence >= 0) factData[factIdx][FI.matchConfidence] = 75;
+        if (FI.matchReason >= 0)     factData[factIdx][FI.matchReason] = 'GEO_ANCHOR_NEW';
+        if (FI.matchAction >= 0)     factData[factIdx][FI.matchAction] = 'CREATE_NEW';
+        if (FI.matchEvidence >= 0) {
+          factData[factIdx][FI.matchEvidence] = 'geo_existing' +
+            (personId ? '|person_new' : '|person_na') +
+            (placeId ? '|place_new' : '|place_na') +
+            '|post_process_v55';
+        }
+        if (FI.updatedAt >= 0) factData[factIdx][FI.updatedAt] = now;
+
+        if (RI.status >= 0)     r[RI.status] = 'Auto_Resolved';
+        if (RI.reviewer >= 0)   r[RI.reviewer] = 'SYSTEM_V55';
+        if (RI.reviewedAt >= 0) r[RI.reviewedAt] = now;
+        if (RI.decision >= 0)   r[RI.decision] = 'CREATE_NEW';
+        if (RI.note >= 0)       r[RI.note] = 'NEW_RECORD_PENDING + Geo match → auto-create by v5.5.010';
+
+        stats.groupB++;
+      } catch (e) {
+        stats.errors++;
+        stats.errorList.push('GroupB: ' + srcRecId + ' - ' + e.message);
+      }
+      continue;
+    }
+
+    // ─────────────────────────────────────────
+    // GROUP C: FUZZY_MATCH score >= 85 → AUTO_MATCH
+    // ─────────────────────────────────────────
+    if (issueType === 'FUZZY_MATCH' && score >= 85) {
+      try {
+        var personId = extractFirstId_(candPerson);
+        var placeId  = extractFirstId_(candPlace);
+        var geoId    = extractFirstId_(candGeo);
+
+        if (personId && FI.personId >= 0) factData[factIdx][FI.personId] = personId;
+        if (placeId && FI.placeId >= 0)  factData[factIdx][FI.placeId] = placeId;
+        if (geoId && FI.geoId >= 0)      factData[factIdx][FI.geoId] = geoId;
+        if (FI.matchStatus >= 0)     factData[factIdx][FI.matchStatus] = 'AUTO_MATCHED';
+        if (FI.matchConfidence >= 0) factData[factIdx][FI.matchConfidence] = score;
+        if (FI.matchReason >= 0)     factData[factIdx][FI.matchReason] = 'FUZZY_HIGH_SCORE_AUTO';
+        if (FI.matchAction >= 0)     factData[factIdx][FI.matchAction] = 'AUTO_MATCH';
+        if (FI.matchEvidence >= 0) {
+          var ev = 'fuzzy_score_' + score;
+          if (geoId) ev += '|geo_confirm';
+          ev += '|post_process_v55';
+          factData[factIdx][FI.matchEvidence] = ev;
+        }
+        if (FI.updatedAt >= 0) factData[factIdx][FI.updatedAt] = now;
+
+        if ((personId || placeId) && geoId) {
+          try {
+            var newDestId = createDestination(personId, placeId, geoId, rawLat, rawLng, '');
+            if (newDestId) {
+              if (FI.destId >= 0) factData[factIdx][FI.destId] = newDestId;
+              stats.destCreated++;
+            }
+          } catch (e2) {
+            stats.errorList.push('Dest-C: ' + srcRecId + ' - ' + e2.message);
+          }
+        }
+
+        if (RI.status >= 0)     r[RI.status] = 'Auto_Resolved';
+        if (RI.reviewer >= 0)   r[RI.reviewer] = 'SYSTEM_V55';
+        if (RI.reviewedAt >= 0) r[RI.reviewedAt] = now;
+        if (RI.decision >= 0)   r[RI.decision] = 'AUTO_MATCH';
+        if (RI.note >= 0)       r[RI.note] = 'FUZZY_MATCH score ' + score + ' → auto-resolved by v5.5.010';
+
+        stats.groupC++;
+      } catch (e) {
+        stats.errors++;
+        stats.errorList.push('GroupC: ' + srcRecId + ' - ' + e.message);
+      }
+      continue;
+    }
+
+    stats.skipped++;
+  }
+
+  // ═══════════════════════════════════════
+  // PHASE 4: เขียนข้อมูลกลับ (Batch Write)
+  // ═══════════════════════════════════════
+
+  try {
+    if (factData.length > 0) {
+      factSheet.getRange(2, 1, factData.length, factCols).setValues(factData);
+    }
+    reviewSheet.getRange(2, 1, reviewData.length, reviewCols).setValues(reviewData);
+  } catch (e) {
+    logError('ReviewService', 'reprocessReviewQueue batch write ล้มเหลว: ' + e.message, e);
+    safeUiAlert_('บันทึกข้อมูลล้มเหลว: ' + e.message + '\nดู log ใน SYS_LOG');
+    return;
+  }
+
+  // ═══════════════════════════════════════
+  // PHASE 5: รายงานผล
+  // ═══════════════════════════════════════
+
+  var totalResolved = stats.groupA + stats.groupB + stats.groupC;
+  var elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  var remaining = (reviewLastRow - 1) - totalResolved;
+
+  var msg =
+    '✅ Post-Processor เสร็จสมบูรณ์ (' + elapsed + ' วินาที)\n\n' +
+    '━━━ ผลลัพธ์ ━━━\n' +
+    '🟢 GEO_NEARBY_YELLOW + name → AUTO_MATCH: ' + stats.groupA + ' รายการ\n' +
+    '🔵 NEW_RECORD_PENDING + Geo → CREATE_NEW: ' + stats.groupB + ' รายการ\n' +
+    '🟡 FUZZY_MATCH 85+ → AUTO_MATCH: ' + stats.groupC + ' รายการ\n' +
+    '🔗 Destination สร้างใหม่: ' + stats.destCreated + ' รายการ\n\n' +
+    '⏭️ ข้าม (ต้อง Review ต่อ): ' + stats.skipped + ' รายการ\n' +
+    '❌ ไม่พบใน FACT: ' + stats.notFound + ' รายการ\n' +
+    '⚠️ Errors: ' + stats.errors + ' รายการ\n\n' +
+    '━━━ สรุป ━━━\n' +
+    'ลด Q_REVIEW: ' + totalResolved + ' → คงเหลือ: ~' + remaining + ' รายการ\n' +
+    'ลดลง: ' + Math.round(totalResolved / (reviewLastRow - 1) * 100) + '%';
+
+  if (stats.errorList.length > 0) {
+    var showErrors = stats.errorList.slice(0, 5);
+    msg += '\n\n⚠️ Error ตัวอย่าง:\n' + showErrors.join('\n');
+    if (stats.errorList.length > 5) {
+      msg += '\n... และอีก ' + (stats.errorList.length - 5) + ' errors (ดูใน SYS_LOG)';
+    }
+  }
+
+  safeUiAlert_(msg);
+  logInfo('ReviewService',
+    'reprocessReviewQueue เสร็จ ' + elapsed + 's | A=' + stats.groupA + ' B=' + stats.groupB +
+    ' C=' + stats.groupC + ' Skip=' + stats.skipped +
+    ' Err=' + stats.errors + ' Dest=' + stats.destCreated
+  );
+}
+
+/**
+ * analyzeReviewPatterns — [V5.5.010] วิเคราะห์ Q_REVIEW ปัจจุบัน
+ * แสดงสถิติแบบแบ่งตาม issue type และคาดการณ์จำนวนที่ auto-resolve ได้
+ */
+function analyzeReviewPatterns() {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var reviewSheet = ss.getSheetByName(SHEET.Q_REVIEW);
+
+    if (!reviewSheet || reviewSheet.getLastRow() < 2) {
+      safeUiAlert_('Q_REVIEW ว่าง — ไม่มีข้อมูลวิเคราะห์');
+      return;
+    }
+
+    var totalRows = reviewSheet.getLastRow() - 1;
+    var totalCols = reviewSheet.getLastColumn();
+
+    var headers = reviewSheet.getRange(1, 1, 1, totalCols).getValues()[0];
+    var data = reviewSheet.getRange(2, 1, totalRows, totalCols).getValues();
+
+    var col = {
+      issueType:  headers.indexOf('issue_type'),
+      score:      headers.indexOf('match_score'),
+      status:     headers.indexOf('status'),
+      rawLat:     headers.indexOf('raw_lat'),
+      candPerson: headers.indexOf('candidate_person_ids'),
+      candPlace:  headers.indexOf('candidate_place_ids'),
+      candGeo:    headers.indexOf('candidate_geo_ids')
+    };
+
+    var patterns = {
+      NEW_GPS: 0, NEW_NO_GPS: 0,
+      FUZZY_85: 0, FUZZY_80: 0, FUZZY_70: 0,
+      GEO_Y_MATCH: 0, GEO_Y_NO: 0, GEO_O: 0,
+      total: 0
+    };
+
+    for (var i = 0; i < totalRows; i++) {
+      var st = String(safeExtractArr_(data[i], col.status)).trim();
+      if (st !== 'Pending') continue;
+      patterns.total++;
+
+      var it = String(safeExtractArr_(data[i], col.issueType)).trim();
+      var sc = parseInt(safeExtractArr_(data[i], col.score)) || 0;
+
+      if (it === 'NEW_RECORD_PENDING') {
+        var lat = safeExtractArr_(data[i], col.rawLat);
+        if (lat && parseFloat(lat) !== 0) {
+          patterns.NEW_GPS++;
+        } else {
+          patterns.NEW_NO_GPS++;
+        }
+      } else if (it === 'FUZZY_MATCH') {
+        if (sc >= 85) patterns.FUZZY_85++;
+        else if (sc >= 80) patterns.FUZZY_80++;
+        else patterns.FUZZY_70++;
+      } else if (it === 'GEO_NEARBY_YELLOW') {
+        var cp = String(safeExtractArr_(data[i], col.candPerson) || '[]').trim();
+        var cpl = String(safeExtractArr_(data[i], col.candPlace) || '[]').trim();
+        if (cp !== '[]' || cpl !== '[]') {
+          patterns.GEO_Y_MATCH++;
+        } else {
+          patterns.GEO_Y_NO++;
+        }
+      } else if (it === 'GEO_NEARBY_ORANGE') {
+        patterns.GEO_O++;
+      }
+    }
+
+    var expectedA = Math.round(patterns.GEO_Y_MATCH * 0.95);
+    var expectedB = Math.round(patterns.NEW_GPS * 0.14);
+    var expectedC = Math.round(patterns.FUZZY_85 * 1.0);
+    var totalExpected = expectedA + expectedB + expectedC;
+
+    var message =
+      '📊 วิเคราะห์ Q_REVIEW Pattern\n\n' +
+      'Q_Pending ทั้งหมด: ' + patterns.total + ' รายการ\n\n' +
+      '🟢 [Group A] GEO_NEARBY_YELLOW + ชื่อตรง: ' + patterns.GEO_Y_MATCH +
+      '\n   → Auto-resolve ได้ ~' + expectedA + ' รายการ\n\n' +
+      '🔵 [Group B] NEW_RECORD_PENDING (มี GPS): ' + patterns.NEW_GPS +
+      '\n   → ในจำนวนนี้ มี Geo candidate ~' + Math.round(patterns.NEW_GPS * 0.14) +
+      ' → Auto-create ได้ ~' + expectedB + ' รายการ\n\n' +
+      '🟡 [Group C] FUZZY_MATCH (score 85-89): ' + patterns.FUZZY_85 +
+      '\n   → Auto-resolve ได้ ~' + expectedC + ' รายการ\n\n' +
+      '📊 คาดการณ์ลด Q_REVIEW: ~' + totalExpected + ' รายการ (' +
+      Math.round(totalExpected / patterns.total * 100) + '%)\n' +
+      '   คงเหลือรอ Review: ~' + (patterns.total - totalExpected) + ' รายการ\n\n' +
+      '━━━ รายละเอียดเพิ่มเติม ━━━\n' +
+      'FUZZY_MATCH 80-84: ' + patterns.FUZZY_80 + '\n' +
+      'FUZZY_MATCH 70-79: ' + patterns.FUZZY_70 + '\n' +
+      'GEO_NEARBY_YELLOW (ไม่มีชื่อ): ' + patterns.GEO_Y_NO + '\n' +
+      'GEO_NEARBY_ORANGE: ' + patterns.GEO_O;
+
+    safeUiAlert_(message);
+    logInfo('ReviewService', 'analyzeReviewPatterns: ' + message.replace(/\n/g, ' | '));
+
+  } catch (err) {
+    logError('ReviewService', 'analyzeReviewPatterns ล้มเหลว: ' + err.message, err);
+    safeUiAlert_('วิเคราะห์ล้มเหลว: ' + err.message);
+  }
+}
